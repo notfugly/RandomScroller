@@ -1,4 +1,4 @@
-# Compose Jetpack Joyride
+# RandomScroller
 
 An Android app that displays a scrollable feed of random images found through the Openverse API.
 
