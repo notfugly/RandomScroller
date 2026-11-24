@@ -1,9 +1,12 @@
+import java.io.DataOutputStream
+
 plugins {
     alias(libs.plugins.android.application)
     alias(libs.plugins.kotlin.compose)
 }
 
 android {
+    androidResources.noCompress += "words"
     namespace = "com.example.composejetpackjoyride"
     compileSdk {
         version = release(37)
@@ -64,4 +67,44 @@ configurations.all {
             useVersion("2.2.10")
         }
     }
+}
+
+@CacheableTask
+abstract class IndexWords : DefaultTask() {
+    @get:InputFile
+    @get:PathSensitive(PathSensitivity.RELATIVE)
+    abstract val dictionary: RegularFileProperty
+
+    @get:OutputDirectory
+    abstract val outputDirectory: DirectoryProperty
+
+    @TaskAction
+    fun index() {
+        val words = dictionary.get().asFile.useLines { lines ->
+            lines.map(String::trim)
+                .filter(String::isNotEmpty)
+                .map { it.toByteArray(Charsets.UTF_8) }
+                .toList()
+        }
+        val directory = outputDirectory.get().asFile
+        directory.mkdirs()
+        DataOutputStream(directory.resolve("random.words").outputStream().buffered()).use { out ->
+            out.writeInt(words.size)
+            var offset = Int.SIZE_BYTES * (words.size + 2)
+            for (word in words) {
+                out.writeInt(offset)
+                offset += word.size
+            }
+            out.writeInt(offset)
+            for (word in words) out.write(word)
+        }
+    }
+}
+
+androidComponents.onVariants { variant ->
+    val variantName = variant.name.replaceFirstChar { it.uppercaseChar() }
+    val indexWords = tasks.register<IndexWords>("index${variantName}Words") {
+        dictionary.set(layout.projectDirectory.file("src/main/dictionary/random_words.txt"))
+    }
+    variant.sources.assets?.addGeneratedSourceDirectory(indexWords, IndexWords::outputDirectory)
 }

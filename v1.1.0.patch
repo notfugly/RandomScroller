@@ -1,0 +1,298 @@
+diff --git a/app/build.gradle.kts b/app/build.gradle.kts
+--- a/app/build.gradle.kts
++++ b/app/build.gradle.kts
+@@ -1 +1,3 @@
++import java.io.DataOutputStream
++
+ plugins {
+@@ -6,2 +8,3 @@
+ android {
++    androidResources.noCompress += "words"
+     namespace = "com.example.composejetpackjoyride"
+@@ -67 +70,41 @@
+ }
++
++@CacheableTask
++abstract class IndexWords : DefaultTask() {
++    @get:InputFile
++    @get:PathSensitive(PathSensitivity.RELATIVE)
++    abstract val dictionary: RegularFileProperty
++
++    @get:OutputDirectory
++    abstract val outputDirectory: DirectoryProperty
++
++    @TaskAction
++    fun index() {
++        val words = dictionary.get().asFile.useLines { lines ->
++            lines.map(String::trim)
++                .filter(String::isNotEmpty)
++                .map { it.toByteArray(Charsets.UTF_8) }
++                .toList()
++        }
++        val directory = outputDirectory.get().asFile
++        directory.mkdirs()
++        DataOutputStream(directory.resolve("random.words").outputStream().buffered()).use { out ->
++            out.writeInt(words.size)
++            var offset = Int.SIZE_BYTES * (words.size + 2)
++            for (word in words) {
++                out.writeInt(offset)
++                offset += word.size
++            }
++            out.writeInt(offset)
++            for (word in words) out.write(word)
++        }
++    }
++}
++
++androidComponents.onVariants { variant ->
++    val variantName = variant.name.replaceFirstChar { it.uppercaseChar() }
++    val indexWords = tasks.register<IndexWords>("index${variantName}Words") {
++        dictionary.set(layout.projectDirectory.file("src/main/dictionary/random_words.txt"))
++    }
++    variant.sources.assets?.addGeneratedSourceDirectory(indexWords, IndexWords::outputDirectory)
++}
+diff --git a/app/src/main/java/com/example/composejetpackjoyride/IndexedWords.kt b/app/src/main/java/com/example/composejetpackjoyride/IndexedWords.kt
+new file mode 100644
+--- /dev/null
++++ b/app/src/main/java/com/example/composejetpackjoyride/IndexedWords.kt
+@@ -0,0 +1,25 @@
++package com.example.composejetpackjoyride
++
++import android.content.res.AssetManager
++import java.nio.channels.FileChannel
++
++internal fun loadIndexedWords(assets: AssetManager): List<String> {
++    val data = assets.openFd("random.words").use { asset ->
++        asset.createInputStream().use { input ->
++            input.channel.map(FileChannel.MapMode.READ_ONLY, asset.startOffset, asset.length)
++        }
++    }
++
++    return object : AbstractList<String>() {
++        override val size = data.getInt(0)
++        private val order = IntArray(size) { it }.apply { shuffle() }
++
++        override fun get(index: Int): String {
++            val offsetEntry = (order[index] + 1) * Int.SIZE_BYTES
++            val start = data.getInt(offsetEntry)
++            val end = data.getInt(offsetEntry + Int.SIZE_BYTES)
++            val bytes = ByteArray(end - start) { data.get(start + it) }
++            return bytes.toString(Charsets.UTF_8)
++        }
++    }
++}
+diff --git a/app/src/main/java/com/example/composejetpackjoyride/FeedProducer.kt b/app/src/main/java/com/example/composejetpackjoyride/FeedProducer.kt
+--- a/app/src/main/java/com/example/composejetpackjoyride/FeedProducer.kt
++++ b/app/src/main/java/com/example/composejetpackjoyride/FeedProducer.kt
+@@ -3,3 +3,8 @@
+ import kotlinx.coroutines.CancellationException
++import kotlinx.coroutines.coroutineScope
+ import kotlinx.coroutines.delay
++import kotlinx.coroutines.launch
++import kotlinx.coroutines.sync.Mutex
++import kotlinx.coroutines.sync.Semaphore
++import kotlinx.coroutines.sync.withLock
+
+@@ -16,3 +21,5 @@
+     wait: suspend (Long) -> Unit = { delay(it) }
+-) {
++): Unit = coroutineScope {
++    val imageSlots = Semaphore(2)
++    val appendMutex = Mutex()
+     var index = 0
+@@ -22,15 +29,4 @@
+         awaitCapacity()
+-        try {
+-            val image = search(words[index])
+-            val loaded = image != null && canDisplay(image)
+-            if (loaded) append(requireNotNull(image))
+-            index++
+-            errorDelayMillis = 3_000L
+-            if (loaded) {
+-                emptyDelayMillis = 250L
+-                wait(250L)
+-            } else {
+-                wait(emptyDelayMillis)
+-                emptyDelayMillis = (emptyDelayMillis * 2).coerceAtMost(4_000L)
+-            }
++        val image = try {
++            search(words[index])
+         } catch (e: CancellationException) {
+@@ -40,2 +36,3 @@
+             wait(e.retryAfterMillis.coerceAtLeast(1_000L))
++            continue
+         } catch (e: SearchAccessDeniedException) {
+@@ -43,2 +40,3 @@
+             wait(60_000L)
++            continue
+         } catch (e: Exception) {
+@@ -48,3 +46,28 @@
+             errorDelayMillis = (errorDelayMillis * 2).coerceAtMost(30_000L)
++            continue
+         }
++        index++
++        errorDelayMillis = 3_000L
++
++        if (image == null) {
++            wait(emptyDelayMillis)
++            emptyDelayMillis = (emptyDelayMillis * 2).coerceAtMost(4_000L)
++            continue
++        }
++
++        imageSlots.acquire()
++        launch {
++            try {
++                if (canDisplay(image)) {
++                    appendMutex.withLock {
++                        awaitCapacity()
++                        append(image)
++                    }
++                }
++            } finally {
++                imageSlots.release()
++            }
++        }
++        emptyDelayMillis = 250L
++        wait(250L)
+     }
+diff --git a/app/src/main/java/com/example/composejetpackjoyride/MainActivity.kt b/app/src/main/java/com/example/composejetpackjoyride/MainActivity.kt
+--- a/app/src/main/java/com/example/composejetpackjoyride/MainActivity.kt
++++ b/app/src/main/java/com/example/composejetpackjoyride/MainActivity.kt
+@@ -2,2 +2,3 @@
+
++import android.content.Context
+ import android.os.Bundle
+@@ -14,5 +15,3 @@
+ import androidx.compose.runtime.LaunchedEffect
+-import androidx.compose.runtime.getValue
+ import androidx.compose.runtime.mutableStateListOf
+-import androidx.compose.runtime.produceState
+ import androidx.compose.runtime.remember
+@@ -30,4 +29,8 @@
+ import coil3.network.okhttp.OkHttpNetworkFetcherFactory
++import coil3.request.CachePolicy
++import coil3.request.ErrorResult
+ import coil3.request.ImageRequest
+ import coil3.request.SuccessResult
++import coil3.size.Precision
++import coil3.size.Scale
+ import kotlinx.coroutines.CancellationException
+@@ -35,5 +38,7 @@
+ import kotlinx.coroutines.flow.first
++import kotlinx.coroutines.launch
+ import kotlinx.coroutines.withContext
+-import org.json.JSONObject
++import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+ import okhttp3.Request
++import org.json.JSONObject
+ import java.net.URLEncoder
+@@ -66,2 +71,10 @@
+
++private fun previewRequest(context: Context, url: String) =
++    ImageRequest.Builder(context)
++        .data(url)
++        .size(480, 854)
++        .scale(Scale.FIT)
++        .precision(Precision.INEXACT)
++        .build()
++
+ @Composable
+@@ -71,12 +84,2 @@
+     val isPreview = LocalInspectionMode.current
+-    val words by produceState<List<String>?>(initialValue = null, context) {
+-        value = withContext(Dispatchers.IO) {
+-            context.resources.openRawResource(R.raw.random_words)
+-                .bufferedReader()
+-                .use { it.readLines() }
+-                .map { it.trim() }
+-                .filter { it.isNotEmpty() }
+-                .shuffled()
+-        }
+-    }
+     val photos = remember { mutableStateListOf<OpenversePhoto>() }
+@@ -85,6 +88,21 @@
+
+-    LaunchedEffect(words, isPreview) {
+-        val availableWords = words ?: return@LaunchedEffect
++    LaunchedEffect(context, isPreview) {
+         if (isPreview) return@LaunchedEffect
++        val startup by lazy { context.getSharedPreferences("feed_startup", Context.MODE_PRIVATE) }
++        launch {
++            val previous = withContext(Dispatchers.IO) {
++                startup.getString("url", null)?.let { url ->
++                    OpenversePhoto(url, startup.getString("title", "").orEmpty())
++                }
++            } ?: return@launch
++            val cached = previewRequest(context, previous.imageUrl).newBuilder()
++                .networkCachePolicy(CachePolicy.DISABLED)
++                .build()
++            if (imageLoader.execute(cached) is SuccessResult && photos.isEmpty()) {
++                photos.add(previous)
++            }
++        }
+
++        val availableWords = withContext(Dispatchers.IO) { loadIndexedWords(context.assets) }
++        var savedStartup = false
+         produceFeed(
+@@ -101,7 +119,7 @@
+                 try {
+-                    val request = ImageRequest.Builder(context)
+-                        .data(photo.imageUrl)
+-                        .size(720, 1280)
+-                        .build()
+-                    imageLoader.execute(request) is SuccessResult
++                    val result = imageLoader.execute(previewRequest(context, photo.imageUrl))
++                    if (result is ErrorResult) {
++                        Log.w("Openverse", "Не удалось загрузить превью", result.throwable)
++                    }
++                    result is SuccessResult
+                 } catch (e: CancellationException) {
+@@ -113,3 +131,14 @@
+             },
+-            append = { photos.add(it) },
++            append = { photo ->
++                if (photos.size != 1 || photos.first().imageUrl != photo.imageUrl) {
++                    photos.add(photo)
++                }
++                if (!savedStartup) {
++                    savedStartup = true
++                    launch(Dispatchers.IO) {
++                        startup.edit().putString("url", photo.imageUrl)
++                            .putString("title", photo.title).apply()
++                    }
++                }
++            },
+             onSearchError = { Log.w("Openverse", "Ошибка поиска; повторим запрос позже", it) }
+@@ -133,3 +162,6 @@
+                     AsyncImage(
+-                        model = photo.imageUrl,
++                        model = remember(context, photo.imageUrl) {
++                            previewRequest(context, photo.imageUrl)
++                        },
++                        imageLoader = imageLoader,
+                         contentDescription = photo.title,
+@@ -179,12 +211,12 @@
+             val item = results.getJSONObject(index)
+-            val imageUrl = item.optString("url", "")
++            val imageUrl = item.optString("thumbnail").toHttpUrlOrNull()?.takeIf { it.isHttps }
++                ?: item.optString("url").toHttpUrlOrNull()?.takeIf { it.isHttps }
++                ?: continue
+             val title = item.optString("title", "")
+-            if (imageUrl.startsWith("https://")) {
+-                suitable.add(
+-                    OpenversePhoto(
+-                        imageUrl = imageUrl,
+-                        title = title.takeUnless { it.isBlank() || it == "null" } ?: word
+-                    )
++            suitable.add(
++                OpenversePhoto(
++                    imageUrl = imageUrl.toString(),
++                    title = title.takeUnless { it.isBlank() || it == "null" } ?: word
+                 )
+-            }
++            )
+         }
+diff --git a/app/src/main/res/raw/random_words.txt b/app/src/main/dictionary/random_words.txt
+similarity index 100%
+rename from app/src/main/res/raw/random_words.txt
+rename to app/src/main/dictionary/random_words.txt
